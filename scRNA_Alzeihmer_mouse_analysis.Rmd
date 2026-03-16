@@ -1,0 +1,430 @@
+---
+title: "MickeyMouse Analysis"
+author: "Roxanne"
+date: "2024-06-04"
+output: html_document
+---
+
+# Alzheimer's in mice - Preliminary Analysis
+
+## Step 1: Load in libraries and data
+
+```{r}
+library(Seurat)
+library(dplyr)
+
+data = Read10X_h5("../data/VisiumFFPE_Mouse_Brain_Alzheimers_AppNote_filtered_feature_bc_matrix.h5")
+sobj = CreateSeuratObject(counts = data,
+                          project = "Mouse_AD",
+                          min.cells = 3, 
+                          min.features = 200)
+rm(data)
+
+# Read in csv with treatment info
+treatment_info = read.csv("../data/VisiumFFPE_Mouse_Brain_Alzheimers_AppNote_aggregation.csv")
+# Getting rid of columns with file paths
+treatment_info = treatment_info[, -c(2, 3, 4)]
+# Adding numbers 1 through 12 to match treatments with barcodes
+treatment_info$Treatment.id = 1:nrow(treatment_info)
+```
+
+```{r AttachCSV}
+# Adding empty columns for treatment information later
+for (column_name in colnames(treatment_info)) {
+    sobj[[column_name]] <- NA
+}
+# Extract the barcode suffixes from the Seurat object:
+barcodes <- colnames(sobj@assays$RNA)
+suffixes <- sub(".*-(\\d+)$", "\\1", barcodes)
+
+# Create a mapping between the suffixes and the treatment information:
+# Ensure Treatment.id is a character for proper matching
+treatment_info$Treatment.id <- as.character(treatment_info$Treatment.id)
+
+# Create a named list for easy lookup based on Treatment.id
+treatment_list <- split(treatment_info, treatment_info$Treatment.id)
+
+# Populate the metadata in the Seurat object:
+# Initialize a data frame to store the treatment information for each cell
+treatment_data <- data.frame(matrix(nrow = length(suffixes), ncol = ncol(treatment_info)))
+colnames(treatment_data) <- colnames(treatment_info)
+
+# Fill the treatment_data based on the suffixes
+for (i in 1:length(suffixes)) {
+    suffix <- suffixes[i]
+    if (suffix %in% names(treatment_list)) {
+        treatment_data[i, ] <- treatment_list[[suffix]]
+    } else {
+        treatment_data[i, ] <- NA
+    }
+}
+
+# Add the treatment data to the Seurat object's metadata
+for (col in colnames(treatment_data)) {
+    sobj[[col]] <- treatment_data[, col]
+}
+
+# Remove temporary variables
+rm(barcodes)
+rm(col)
+rm(column_name)
+rm(treatment_list)
+rm(treatment_data)
+rm(i)
+rm(suffix)
+rm(suffixes)
+
+# View updated metadata to verify
+tail(sobj@meta.data)
+
+```
+
+```{r subsetting sobj}
+# Subsetting Seurat object
+sobjOldMice <- subset(x = sobj, subset = Treatment.id == c("1", "2", "7", "8"))
+
+# Verify
+tail(sobjOldMice@meta.data)
+rm(sobj)
+
+# Save raw subset
+saveRDS(sobjOldMice, file = "../data/MM_Day3_OldMice_raw.rds")
+
+```
+
+Let us see the structure of the Seurat object
+
+```{r}
+sobjOldMice@assays
+```
+
+```{r}
+# raw counts of cells
+sobjOldMice@assays$RNA@layers$counts[1:10, 1:10]
+
+# sparse Matrix results because not every cell type expresses every gene
+```
+
+```{r}
+# see cell barcode of the data
+sobjOldMice@assays$RNA@cells@.Data %>% tail(50)
+```
+
+```{r}
+# see the features (gene names)
+sobjOldMice@assays$RNA
+```
+
+```{r}
+sobjOldMice@meta.data %>% head(100)
+
+# gives overview of cell types, counts of these cells and the number of expressed genes
+```
+
+## Step 2: Preprocess and quality control
+
+Mitochondrial DNA (mtDNA)
+
+Important to filter out cells with high mt expression, because the mt of dying cells can give an impression of higher expression levels because the DNA leaks in the cells.
+
+--\> No MT data, trimmed
+
+```{r}
+# Visualize the results
+VlnPlot(sobjOldMice,
+        features = c("nFeature_RNA", "nCount_RNA"),
+        ncol = 3)
+
+# No MT DNA
+```
+
+```{r}
+# filter outliers from expression data
+sobjOldMice = subset(
+  sobjOldMice,
+  subset = nFeature_RNA > 3000 & nFeature_RNA < 8500
+)
+
+```
+
+## Step 3: Normalize the data
+
+We use log normalization to normalize our data.
+
+```{r}
+sobjOldMice = NormalizeData(sobjOldMice, normalization.method = "LogNormalize")
+sobjOldMice@assays$RNA
+```
+
+```{r}
+sobjOldMice@assays$RNA@layers$data[1:5, 1:3]
+```
+
+## Step 4: Feature extraction
+
+```{r}
+# Find top 1000 features (genes)
+sobjOldMice = FindVariableFeatures(sobjOldMice, nfeatures = 1000)
+
+# Identify the 10 most highly variable genes
+top10_OldMice = VariableFeatures(sobjOldMice) %>% head(10)
+
+# Plot variable features with and without labels
+plot_OldMice = VariableFeaturePlot(sobjOldMice)
+plot_OldMice = LabelPoints(plot = plot_OldMice, points = top10_OldMice, repel = TRUE)
+plot_OldMice
+
+# Standardized variance tells us how different the genes are across cells
+```
+
+## Step 5: Dimensional Reduction
+
+Here we first scale the data and then perform principal component analysis (PCA).
+
+```{r}
+# Create uniform scaling for data points
+sobjOldMice = ScaleData(sobjOldMice)
+
+```
+
+```{r}
+# visualize pca results in elbow plot, through dimensional reduction
+sobjOldMice = RunPCA(sobjOldMice, features = VariableFeatures(object = sobjOldMice))
+
+
+# The principal component in a principal component analysis (PCA) is a new, uncorrelated variable derived from the original variables that captures the maximum possible variance in the data.
+
+# Tries to find the optimal number of features (ie. Benign, Malignant, Specific gene expression levels) to describe the maximum possible variance.
+ElbowPlot(sobjOldMice)
+```
+
+## Step 6: Clustering the cells
+
+Here we used UMAP (Uniform Manifold Approximation and Projection) to cluster the cells.
+
+Also used as an addendum for previous step for non-linear data.
+
+```{r}
+# dimensions dependant on output of previous step
+# range dependant on highest non-stable PC value
+
+# SNN: Shared Nearest Neighbor
+sobjOldMice = FindNeighbors(sobjOldMice, dims = 1:11) 
+
+# Default resolution 1, higher value results in higher res. (more cell types)
+sobjOldMice = FindClusters(sobjOldMice, resolution = 0.5)
+# UMAP
+sobjOldMice = RunUMAP(sobjOldMice, dims = 1:11)
+DimPlot(sobjOldMice, reduction = "umap")
+
+```
+
+## Step 7: Save your Seurat object as a rds file
+
+A review of your Seurat object. Now you have finished the first part of standard workflow of scRNAseq then you can save your Seurat object for future usage.
+
+```{r}
+saveRDS(sobjOldMice, file = "../data/sobjOldMice_postUMAP_day3.rds")
+
+# read Seurat rds object
+# sobj = readRDS("../data/")
+
+
+```
+
+## Step 8: Find cell markers
+
+```{r}
+# Find all markers
+sobjOldMice.markers = FindAllMarkers(sobjOldMice, only.pos = TRUE)
+sobjOldMice.markers %>%
+  head(100)
+
+# Gene marker St18 for Oligodendrocytes present in CL 1, 3, 4, 11
+
+# pct 1 = proportion of cells from chosen cluster which express the marker
+# pct 2 = proportion of cells from all other clusters which express this marker
+# avglog = +- indicated high and low expression levels
+# --> finding a gene that is expressed in all clusters aside from target one can also serve as a marker
+
+```
+
+## Step 9: Marker based annotation with Cellmarker
+
+```{r}
+# Read in CellMarker excel file
+library(readxl)
+cellmarkers = read_xlsx("../data/Cell_marker_All.xlsx")
+
+
+cellmarker_filtered = dplyr::filter(cellmarkers, species == 'Mouse', cancer_type == 'Normal', tissue_class == 'Brain')
+rm(cellmarkers)
+```
+
+```{r}
+# Combine CellMarker with our markers sobj.markers.
+merg_cellm_OldMice = sobjOldMice.markers %>%
+  filter(p_val_adj < 0.05 & avg_log2FC > 1 & pct.1 > 0.8 & pct.2 < 0.4) %>%
+  left_join(cellmarker_filtered[,c(3,7,8,9)], join_by(gene==marker), relationship = "many-to-many")
+
+merg_cellm_OldMice %>% filter(cell_name == "Oligodendrocyte")
+```
+
+Check selected genes for oligodendrocytes with FeaturePlot( )
+
+```{r}
+oligo_genes = c("St18", "Tcf7l2", "AW551984", "Rras2", "Ust", "Bcar1" )
+FeaturePlot(sobjOldMice, features = oligo_genes)
+```
+
+Trying to narrow down clusters with automatic cell annotation methods from celldex and SingleR.
+
+```{r}
+# Load libraries for cell annotation
+library(SingleR)
+library(Seurat)
+library(celldex)
+library(dplyr)
+library(pheatmap)
+```
+
+```{r}
+# Find top markers for all clusters
+# Grouping neccessary to get top 3 for every cluster
+sobjOldMice.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1 & p_val < 0.05 & pct.1 > 0.9) %>%
+  slice_head(n = 3) -> top3OldMice
+
+```
+
+## Step 10: Automatic cell annotation with SingleR
+
+### Prepare inputs for running automatic cell type annotation
+
+We need to extract the normalization data using GetAssayData()
+
+```{r}
+sobjOldMice_count = GetAssayData(sobjOldMice, layer = "data") 
+str(sobjOldMice_count)
+
+```
+
+Get the reference db for Mice and Encode reference data from celldex package:
+
+```{r}
+ref_Mouse = celldex::MouseRNAseqData() 
+ref_Mouse
+
+```
+
+### Run SingleR to label cell types
+
+```{r}
+pred_OldMice = SingleR(test = sobjOldMice_count, ref = ref_Mouse, labels = ref_Mouse$label.main)
+
+```
+
+Next, we put the prediction results back to our Seurat object for visualization
+
+```{r}
+sobjOldMice$labels = pred_OldMice[match(rownames(sobjOldMice@meta.data), rownames(pred_OldMice)), 'labels'] 
+sobjOldMice@meta.data %>% head()
+
+```
+
+### Visualize the data
+
+```{r}
+umap_pred_OldMice = DimPlot(   
+  sobjOldMice, reduction = 'umap', group.by = 'labels', label = TRUE, repel = TRUE)
+umap_pred_OldMice
+
+```
+
+Plot the SingleR assignment score across all cell-label combinations
+
+```{r}
+plotScoreHeatmap(pred_OldMice)
+
+```
+
+## Step 11: Manual annotation
+
+Manually rename clusters to identified cell types using RenameIdents( ):
+
+```{r}
+sobjOldMice_new = RenameIdents(sobjOldMice, '11' = 'Oligodendrocytes')
+DimPlot(sobjOldMice_new, reduction = 'umap', label = TRUE)
+```
+
+## Step 12: Differential gene expression
+
+```{r}
+# Load libraries
+install.packages("org.Mm.eg.db")
+library(org.Mm.eg.db) 
+library(clusterProfiler)
+library(DOSE)
+```
+
+Following code copied from tutorial...
+
+Please rename variables to fit current dataset.
+
+```{r}
+# Mesenchymal cells or Fibroblasts? Comparing Cluster 2 with CL7
+marker_7_2 = FindMarkers(sobj, ident.1 = 7, ident.2 = 2) #Marker comparison
+
+# Trying to select sign values
+marker_7_2_sig = marker_7_2 %>%
+  filter(abs(avg_log2FC) >= 1 & p_val_adj < 0.05 & pct.2 < 0.4)
+
+# Identified 728 differentially expressed genes
+str(marker_7_2_sig)
+```
+
+```{r}
+# Find the top 5 genes of the 728 differentially expressed genes
+log2 = marker_7_2_sig$avg_log2FC
+names(log2) = rownames(marker_7_2_sig)
+
+log2_sort = sort(log2, decreasing = TRUE)
+log2_sort[1:5]
+```
+
+Run gene set enrichment analysis:
+
+```{r}
+# Ontology infered through Ensembl human database
+gse = gseGO(geneList = log2_sort,
+            ont = "ALL",
+            keyType = "SYMBOL",
+            nPerm = 10000,
+            OrgDb = "org.Hs.eg.db")
+```
+
+Visualize the results using dotplot.
+
+```{r}
+dotplot(gse)
+
+# Y Axis: Top 10 Gene Ontology terms for our genes
+# X Axis: Percentage of genes corresponding to the Ontology in comparison to Cluster 2
+# Ontology points to cells relevant for immuno responses not fat tissue (as suggested from reference)
+```
+
+Put the identity back.
+
+```{r}
+sobj_new = RenameIdents(sobj, 
+                        '7' = 'Mesenchymal cells', 
+                        '2' = 'Fibroblasts')
+DimPlot(sobj_new, reduction = 'umap', label = TRUE)
+```
+
+Save Seurat object for future work.
+
+```{r}
+saveRDS(sobj_new, file = "./bc_tutorial_day2.rds")
+```
